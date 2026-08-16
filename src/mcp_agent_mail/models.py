@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import Column, Index, UniqueConstraint
+from sqlalchemy import Column, Index, UniqueConstraint, text
 from sqlalchemy.types import JSON
 from sqlmodel import Field, SQLModel
 
@@ -92,6 +92,14 @@ class Message(SQLModel, table=True):
         Index("idx_messages_project_created", "project_id", "created_ts"),
         Index("idx_messages_project_sender_created", "project_id", "sender_id", "created_ts"),
         Index("idx_messages_project_topic", "project_id", "topic"),
+        Index(
+            "uq_messages_project_sender_idempotency_key",
+            "project_id",
+            "sender_id",
+            "idempotency_key",
+            unique=True,
+            sqlite_where=text("idempotency_key IS NOT NULL"),
+        ),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -107,6 +115,8 @@ class Message(SQLModel, table=True):
     body_md: str
     importance: str = Field(default="normal", max_length=16)
     ack_required: bool = Field(default=False)
+    idempotency_key: Optional[str] = Field(default=None, max_length=256)
+    content_digest: Optional[str] = Field(default=None, max_length=64)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     attachments: list[dict[str, Any]] = Field(
         default_factory=list,

@@ -130,6 +130,52 @@ async def test_concurrent_message_sends(isolated_env):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_identical_idempotent_sends_create_one_message(isolated_env):
+    """Concurrent retries with one key converge on one stored message."""
+    settings = _config.get_settings()
+    data = await _setup_project_and_agents(settings)
+    sender = data["agents"][0]
+    recipient = data["agents"][1]
+    arguments = {
+        "project_key": "/tmp/concurrent-test",
+        "sender_name": sender,
+        "sender_token": data["tokens_by_name"][sender],
+        "to": [recipient],
+        "subject": "One durable delivery",
+        "body_md": "Every concurrent call carries identical content.",
+        "importance": "high",
+        "ack_required": True,
+        "topic": "agent-board",
+        "idempotency_key": "concurrent-board-delivery-1",
+    }
+    server = build_mcp_server()
+
+    async with Client(server) as client:
+        results = await asyncio.gather(
+            *(client.call_tool("send_message", arguments) for _ in range(10)),
+            return_exceptions=True,
+        )
+
+    errors = [result for result in results if isinstance(result, BaseException)]
+    assert errors == []
+    message_ids: set[int] = set()
+    for result in results:
+        assert not isinstance(result, BaseException)
+        message_ids.add(result.data["deliveries"][0]["payload"]["id"])
+    assert len(message_ids) == 1
+    async with get_session() as session:
+        row = await session.execute(
+            text(
+                "SELECT COUNT(*) FROM messages "
+                "WHERE project_id = :project_id AND sender_id = "
+                "(SELECT id FROM agents WHERE project_id = :project_id AND name = :sender)"
+            ),
+            {"project_id": data["project_id"], "sender": sender},
+        )
+        assert row.scalar_one() == 1
+
+
+@pytest.mark.asyncio
 async def test_concurrent_messages_to_same_thread(isolated_env):
     """Test multiple agents writing to the same thread concurrently."""
     settings = _config.get_settings()

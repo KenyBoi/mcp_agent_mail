@@ -185,6 +185,167 @@ async def test_send_message_message_id_returned(isolated_env):
         assert payload["id"] > 0
 
 
+@pytest.mark.asyncio
+async def test_send_message_idempotent_replay_returns_original_receipt(isolated_env):
+    """An identical idempotency replay returns the original message receipt."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, receiver = await setup_project_with_agents(client, "/test/idempotent-replay", count=2)
+        arguments = {
+            "project_key": "/test/idempotent-replay",
+            "sender_name": sender,
+            "to": [receiver],
+            "subject": "Review the board item",
+            "body_md": "Open the board and review message msg-123.",
+            "importance": "high",
+            "ack_required": True,
+            "topic": "agent-board",
+            "idempotency_key": "board-mail-msg-123-receiver",
+        }
+
+        first = await client.call_tool("send_message", arguments)
+        replay = await client.call_tool("send_message", arguments)
+
+        assert replay.data == first.data
+        assert replay.data["deliveries"][0]["payload"]["idempotency_key"] == arguments["idempotency_key"]
+        inbox = await client.call_tool(
+            "fetch_inbox",
+            {
+                "project_key": "/test/idempotent-replay",
+                "agent_name": receiver,
+                "limit": 10,
+            },
+        )
+        matching = [item for item in get_inbox_items(inbox) if item.get("subject") == "Review the board item"]
+        assert len(matching) == 1
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        pytest.param("to", "alternate_recipient", id="recipients"),
+        pytest.param("subject", "A different subject", id="subject"),
+        pytest.param("body_md", "Different body content.", id="body"),
+        pytest.param("importance", "urgent", id="importance"),
+        pytest.param("ack_required", False, id="ack-required"),
+        pytest.param("topic", "different-topic", id="topic"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_send_message_idempotency_key_reuse_with_different_content_fails(
+    isolated_env,
+    changed_field,
+    changed_value,
+):
+    """A key cannot be reused for a different canonical message."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, receiver, alternate = await setup_project_with_agents(
+            client,
+            f"/test/idempotency-conflict-{changed_field}",
+            count=3,
+        )
+        arguments = {
+            "project_key": f"/test/idempotency-conflict-{changed_field}",
+            "sender_name": sender,
+            "to": [receiver],
+            "subject": "Original subject",
+            "body_md": "Original body.",
+            "importance": "high",
+            "ack_required": True,
+            "topic": "agent-board",
+            "idempotency_key": "stable-delivery-key",
+        }
+        await client.call_tool("send_message", arguments)
+        changed_arguments = dict(arguments)
+        changed_arguments[changed_field] = [alternate] if changed_value == "alternate_recipient" else changed_value
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool("send_message", changed_arguments)
+
+        assert "idempotency key was already used for different message content" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_send_message_idempotency_rejects_reordered_recipients(isolated_env):
+    """A replay cannot change receipt ordering while retaining the same digest."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, first_receiver, second_receiver = await setup_project_with_agents(
+            client,
+            "/test/idempotency-recipient-order",
+            count=3,
+        )
+        arguments = {
+            "project_key": "/test/idempotency-recipient-order",
+            "sender_name": sender,
+            "to": [first_receiver, second_receiver],
+            "subject": "Stable recipient order",
+            "body_md": "The receipt must remain byte-for-byte stable.",
+            "idempotency_key": "stable-recipient-order",
+        }
+        await client.call_tool("send_message", arguments)
+        reordered_arguments = {**arguments, "to": [second_receiver, first_receiver]}
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool("send_message", reordered_arguments)
+
+        assert "idempotency key was already used for different message content" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_send_message_without_idempotency_key_retains_existing_behavior(isolated_env):
+    """Omitting the optional key continues to create a new message per call."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, receiver = await setup_project_with_agents(client, "/test/no-idempotency-key", count=2)
+        arguments = {
+            "project_key": "/test/no-idempotency-key",
+            "sender_name": sender,
+            "to": [receiver],
+            "subject": "Repeatable without a key",
+            "body_md": "Each call is a distinct message.",
+        }
+
+        first = await client.call_tool("send_message", arguments)
+        second = await client.call_tool("send_message", arguments)
+
+        assert first.data["deliveries"][0]["payload"]["id"] != second.data["deliveries"][0]["payload"]["id"]
+        inbox = await client.call_tool(
+            "fetch_inbox",
+            {
+                "project_key": "/test/no-idempotency-key",
+                "agent_name": receiver,
+                "limit": 10,
+            },
+        )
+        matching = [item for item in get_inbox_items(inbox) if item.get("subject") == "Repeatable without a key"]
+        assert len(matching) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_message_rejects_unbounded_idempotency_key(isolated_env):
+    """The public idempotency key is bounded before any database write."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, receiver = await setup_project_with_agents(client, "/test/idempotency-key-bound", count=2)
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "/test/idempotency-key-bound",
+                    "sender_name": sender,
+                    "to": [receiver],
+                    "subject": "Bounded key",
+                    "body_md": "This must not be stored.",
+                    "idempotency_key": "x" * 257,
+                },
+            )
+
+        assert "idempotency_key must contain 1-256 characters" in str(exc_info.value)
+
+
 # ============================================================================
 # Multiple Recipients Tests
 # ============================================================================
