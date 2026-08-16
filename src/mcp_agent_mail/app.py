@@ -69,6 +69,7 @@ from .models import (
     WindowIdentity,
 )
 from .storage import (
+    _IMAGE_PATTERN,
     GitIndexLockError,
     ProjectArchive,
     archive_write_lock,
@@ -3845,6 +3846,8 @@ def _attachment_source_digest(
     settings: Settings,
     project: Project,
     attachment_paths: Sequence[str],
+    body_md: str = "",
+    include_markdown: bool = False,
 ) -> tuple[str, bool]:
     """Hash available attachment sources without mutating the archive.
 
@@ -3853,12 +3856,19 @@ def _attachment_source_digest(
     sources are content-bound, preventing a changed file at the same path from
     being accepted as an identical idempotent request.
     """
-    if not attachment_paths:
+    source_paths = list(attachment_paths)
+    if include_markdown:
+        source_paths.extend(
+            match.group("path").strip()
+            for match in _IMAGE_PATTERN.finditer(body_md)
+            if not match.group("path").strip().startswith("data:")
+        )
+    if not source_paths:
         return hashlib.sha256(b"[]").hexdigest(), True
     archive_root = Path(settings.storage.root).expanduser().resolve() / "projects" / project.slug
     fingerprints: list[dict[str, str | None]] = []
     all_available = True
-    for raw_path in attachment_paths:
+    for raw_path in source_paths:
         path = Path(raw_path).expanduser()
         if not path.is_absolute():
             path = archive_root / path
@@ -5723,6 +5733,8 @@ def build_mcp_server() -> FastMCP:
                 settings=settings,
                 project=project,
                 attachment_paths=attachment_paths or [],
+                body_md=body_md,
+                include_markdown=convert_markdown or embed_policy in {"inline", "file"},
             )
         content_digest = (
             _message_source_digest(cast(str, request_digest), attachment_digest)

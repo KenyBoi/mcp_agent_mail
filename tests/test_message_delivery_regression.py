@@ -317,6 +317,44 @@ async def test_send_message_idempotent_attachment_content_change_conflicts(
         assert "different message content" in str(exc_info.value)
 
 
+@pytest.mark.asyncio
+async def test_send_message_idempotent_markdown_image_content_change_conflicts(
+    isolated_env,
+    monkeypatch,
+    tmp_path,
+):
+    """Converted Markdown image sources are included in idempotency identity."""
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
+    _config.clear_settings_cache()
+    source_path = tmp_path / "mutable-markdown-image.png"
+    Image.new("RGB", (4, 4), color=(12, 34, 56)).save(source_path)
+    body = f"![review image]({source_path})"
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, receiver = await setup_project_with_agents(
+            client,
+            "/test/idempotency-markdown-image-conflict",
+            count=2,
+        )
+        arguments = {
+            "project_key": "/test/idempotency-markdown-image-conflict",
+            "sender_name": sender,
+            "to": [receiver],
+            "subject": "Mutable Markdown image",
+            "body_md": body,
+            "convert_images": True,
+            "idempotency_key": "mutable-markdown-image-receipt",
+        }
+        await client.call_tool("send_message", arguments)
+        Image.new("RGB", (4, 4), color=(201, 202, 203)).save(source_path)
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool("send_message", arguments)
+
+        assert "different message content" in str(exc_info.value)
+
+
 @pytest.mark.parametrize(
     ("changed_field", "changed_value"),
     [
