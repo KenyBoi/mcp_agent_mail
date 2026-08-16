@@ -14,12 +14,16 @@ Reference: mcp_agent_mail-uvf
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fastmcp import Client
+from PIL import Image
 
+from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import _get_agent, _get_project_by_identifier, _list_outbox, build_mcp_server
+from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.db import ensure_schema, track_queries
 
 
@@ -218,6 +222,62 @@ async def test_send_message_idempotent_replay_returns_original_receipt(isolated_
         )
         matching = [item for item in get_inbox_items(inbox) if item.get("subject") == "Review the board item"]
         assert len(matching) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_message_idempotent_attachment_replay_does_not_reread_source(
+    isolated_env,
+    monkeypatch,
+    tmp_path,
+):
+    """An attachment replay uses the stored receipt without touching its deleted source."""
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
+    _config.clear_settings_cache()
+    storage_root = Path(get_settings().storage.root).expanduser().resolve()
+    source_path = tmp_path / "ephemeral-attachment.png"
+    Image.new("RGB", (4, 4), color=(12, 34, 56)).save(source_path)
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, receiver = await setup_project_with_agents(
+            client,
+            "/test/idempotency-attachment-replay",
+            count=2,
+        )
+        arguments = {
+            "project_key": "/test/idempotency-attachment-replay",
+            "sender_name": sender,
+            "to": [receiver],
+            "subject": "Ephemeral attachment",
+            "body_md": "The source may disappear after the first accepted call.",
+            "attachment_paths": [str(source_path)],
+            "idempotency_key": "ephemeral-attachment-receipt",
+        }
+        first = await client.call_tool("send_message", arguments)
+
+        project = await _get_project_by_identifier(arguments["project_key"])
+        project_root = storage_root / "projects" / project.slug
+
+        def _archive_state() -> dict[str, tuple[bytes, int]]:
+            return {
+                path.relative_to(project_root).as_posix(): (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in sorted(project_root.rglob("*"))
+                if path.is_file()
+            }
+
+        before_replay = _archive_state()
+        assert any(path.startswith("attachments/_audit/") for path in before_replay)
+
+        replay_with_source = await client.call_tool("send_message", arguments)
+
+        assert replay_with_source.data == first.data
+        assert _archive_state() == before_replay
+        source_path.unlink()
+
+        replay_after_delete = await client.call_tool("send_message", arguments)
+
+        assert replay_after_delete.data == first.data
+        assert _archive_state() == before_replay
 
 
 @pytest.mark.parametrize(
