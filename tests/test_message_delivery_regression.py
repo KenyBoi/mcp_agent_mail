@@ -14,12 +14,16 @@ Reference: mcp_agent_mail-uvf
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fastmcp import Client
+from PIL import Image
 
+from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import _get_agent, _get_project_by_identifier, _list_outbox, build_mcp_server
+from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.db import ensure_schema, track_queries
 
 
@@ -183,6 +187,298 @@ async def test_send_message_message_id_returned(isolated_env):
         assert "id" in payload
         assert isinstance(payload["id"], int)
         assert payload["id"] > 0
+
+
+@pytest.mark.asyncio
+async def test_send_message_idempotent_replay_returns_original_receipt(isolated_env):
+    """An identical idempotency replay returns the original message receipt."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, receiver = await setup_project_with_agents(client, "/test/idempotent-replay", count=2)
+        arguments = {
+            "project_key": "/test/idempotent-replay",
+            "sender_name": sender,
+            "to": [receiver],
+            "subject": "Review the board item",
+            "body_md": "Open the board and review message msg-123.",
+            "importance": "high",
+            "ack_required": True,
+            "topic": "agent-board",
+            "idempotency_key": "board-mail-msg-123-receiver",
+        }
+
+        first = await client.call_tool("send_message", arguments)
+        replay = await client.call_tool("send_message", arguments)
+
+        assert replay.data == first.data
+        assert replay.data["deliveries"][0]["payload"]["idempotency_key"] == arguments["idempotency_key"]
+        inbox = await client.call_tool(
+            "fetch_inbox",
+            {
+                "project_key": "/test/idempotent-replay",
+                "agent_name": receiver,
+                "limit": 10,
+            },
+        )
+        matching = [item for item in get_inbox_items(inbox) if item.get("subject") == "Review the board item"]
+        assert len(matching) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_message_idempotent_attachment_replay_does_not_reread_source(
+    isolated_env,
+    monkeypatch,
+    tmp_path,
+):
+    """An attachment replay uses the stored receipt without touching its deleted source."""
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
+    _config.clear_settings_cache()
+    storage_root = Path(get_settings().storage.root).expanduser().resolve()
+    source_path = tmp_path / "ephemeral-attachment.png"
+    Image.new("RGB", (4, 4), color=(12, 34, 56)).save(source_path)
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, receiver = await setup_project_with_agents(
+            client,
+            "/test/idempotency-attachment-replay",
+            count=2,
+        )
+        arguments = {
+            "project_key": "/test/idempotency-attachment-replay",
+            "sender_name": sender,
+            "to": [receiver],
+            "subject": "Ephemeral attachment",
+            "body_md": "The source may disappear after the first accepted call.",
+            "attachment_paths": [str(source_path)],
+            "idempotency_key": "ephemeral-attachment-receipt",
+        }
+        first = await client.call_tool("send_message", arguments)
+
+        project = await _get_project_by_identifier(arguments["project_key"])
+        project_root = storage_root / "projects" / project.slug
+
+        def _archive_state() -> dict[str, tuple[bytes, int]]:
+            return {
+                path.relative_to(project_root).as_posix(): (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in sorted(project_root.rglob("*"))
+                if path.is_file()
+            }
+
+        before_replay = _archive_state()
+        assert any(path.startswith("attachments/_audit/") for path in before_replay)
+
+        replay_with_source = await client.call_tool("send_message", arguments)
+
+        assert replay_with_source.data == first.data
+        assert _archive_state() == before_replay
+        source_path.unlink()
+
+        replay_after_delete = await client.call_tool("send_message", arguments)
+
+        assert replay_after_delete.data == first.data
+        assert _archive_state() == before_replay
+
+
+@pytest.mark.asyncio
+async def test_send_message_idempotent_attachment_content_change_conflicts(
+    isolated_env,
+    monkeypatch,
+    tmp_path,
+):
+    """Replacing an existing attachment at the same path is not an identical replay."""
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
+    _config.clear_settings_cache()
+    source_path = tmp_path / "mutable-attachment.png"
+    Image.new("RGB", (4, 4), color=(12, 34, 56)).save(source_path)
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, receiver = await setup_project_with_agents(
+            client,
+            "/test/idempotency-attachment-conflict",
+            count=2,
+        )
+        arguments = {
+            "project_key": "/test/idempotency-attachment-conflict",
+            "sender_name": sender,
+            "to": [receiver],
+            "subject": "Mutable attachment",
+            "body_md": "The source content changes after acceptance.",
+            "attachment_paths": [str(source_path)],
+            "idempotency_key": "mutable-attachment-receipt",
+        }
+        await client.call_tool("send_message", arguments)
+        Image.new("RGB", (4, 4), color=(201, 202, 203)).save(source_path)
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool("send_message", arguments)
+
+        assert "different message content" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_send_message_idempotent_markdown_image_content_change_conflicts(
+    isolated_env,
+    monkeypatch,
+    tmp_path,
+):
+    """Converted Markdown image sources are included in idempotency identity."""
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
+    _config.clear_settings_cache()
+    source_path = tmp_path / "mutable-markdown-image.png"
+    Image.new("RGB", (4, 4), color=(12, 34, 56)).save(source_path)
+    body = f"![review image]({source_path})"
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, receiver = await setup_project_with_agents(
+            client,
+            "/test/idempotency-markdown-image-conflict",
+            count=2,
+        )
+        arguments = {
+            "project_key": "/test/idempotency-markdown-image-conflict",
+            "sender_name": sender,
+            "to": [receiver],
+            "subject": "Mutable Markdown image",
+            "body_md": body,
+            "convert_images": True,
+            "idempotency_key": "mutable-markdown-image-receipt",
+        }
+        await client.call_tool("send_message", arguments)
+        Image.new("RGB", (4, 4), color=(201, 202, 203)).save(source_path)
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool("send_message", arguments)
+
+        assert "different message content" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        pytest.param("to", "alternate_recipient", id="recipients"),
+        pytest.param("subject", "A different subject", id="subject"),
+        pytest.param("body_md", "Different body content.", id="body"),
+        pytest.param("importance", "urgent", id="importance"),
+        pytest.param("ack_required", False, id="ack-required"),
+        pytest.param("topic", "different-topic", id="topic"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_send_message_idempotency_key_reuse_with_different_content_fails(
+    isolated_env,
+    changed_field,
+    changed_value,
+):
+    """A key cannot be reused for a different canonical message."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, receiver, alternate = await setup_project_with_agents(
+            client,
+            f"/test/idempotency-conflict-{changed_field}",
+            count=3,
+        )
+        arguments = {
+            "project_key": f"/test/idempotency-conflict-{changed_field}",
+            "sender_name": sender,
+            "to": [receiver],
+            "subject": "Original subject",
+            "body_md": "Original body.",
+            "importance": "high",
+            "ack_required": True,
+            "topic": "agent-board",
+            "idempotency_key": "stable-delivery-key",
+        }
+        await client.call_tool("send_message", arguments)
+        changed_arguments = dict(arguments)
+        changed_arguments[changed_field] = [alternate] if changed_value == "alternate_recipient" else changed_value
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool("send_message", changed_arguments)
+
+        assert "idempotency key was already used for different message content" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_send_message_idempotency_rejects_reordered_recipients(isolated_env):
+    """A replay cannot change receipt ordering while retaining the same digest."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, first_receiver, second_receiver = await setup_project_with_agents(
+            client,
+            "/test/idempotency-recipient-order",
+            count=3,
+        )
+        arguments = {
+            "project_key": "/test/idempotency-recipient-order",
+            "sender_name": sender,
+            "to": [first_receiver, second_receiver],
+            "subject": "Stable recipient order",
+            "body_md": "The receipt must remain byte-for-byte stable.",
+            "idempotency_key": "stable-recipient-order",
+        }
+        await client.call_tool("send_message", arguments)
+        reordered_arguments = {**arguments, "to": [second_receiver, first_receiver]}
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool("send_message", reordered_arguments)
+
+        assert "idempotency key was already used for different message content" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_send_message_without_idempotency_key_retains_existing_behavior(isolated_env):
+    """Omitting the optional key continues to create a new message per call."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, receiver = await setup_project_with_agents(client, "/test/no-idempotency-key", count=2)
+        arguments = {
+            "project_key": "/test/no-idempotency-key",
+            "sender_name": sender,
+            "to": [receiver],
+            "subject": "Repeatable without a key",
+            "body_md": "Each call is a distinct message.",
+        }
+
+        first = await client.call_tool("send_message", arguments)
+        second = await client.call_tool("send_message", arguments)
+
+        assert first.data["deliveries"][0]["payload"]["id"] != second.data["deliveries"][0]["payload"]["id"]
+        inbox = await client.call_tool(
+            "fetch_inbox",
+            {
+                "project_key": "/test/no-idempotency-key",
+                "agent_name": receiver,
+                "limit": 10,
+            },
+        )
+        matching = [item for item in get_inbox_items(inbox) if item.get("subject") == "Repeatable without a key"]
+        assert len(matching) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_message_rejects_unbounded_idempotency_key(isolated_env):
+    """The public idempotency key is bounded before any database write."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, receiver = await setup_project_with_agents(client, "/test/idempotency-key-bound", count=2)
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "/test/idempotency-key-bound",
+                    "sender_name": sender,
+                    "to": [receiver],
+                    "subject": "Bounded key",
+                    "body_md": "This must not be stored.",
+                    "idempotency_key": "x" * 257,
+                },
+            )
+
+        assert "idempotency_key must contain 1-256 characters" in str(exc_info.value)
 
 
 # ============================================================================

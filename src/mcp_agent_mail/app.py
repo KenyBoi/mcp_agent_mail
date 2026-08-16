@@ -69,6 +69,7 @@ from .models import (
     WindowIdentity,
 )
 from .storage import (
+    _IMAGE_PATTERN,
     GitIndexLockError,
     ProjectArchive,
     archive_write_lock,
@@ -1857,6 +1858,8 @@ def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, A
     }
     if include_body:
         data["body_md"] = message.body_md
+    if message.idempotency_key is not None:
+        data["idempotency_key"] = message.idempotency_key
     return data
 
 
@@ -3788,6 +3791,171 @@ async def _get_agents_batch_lenient(project: Project, names: Sequence[str]) -> d
     return resolved
 
 
+def _message_content_digest(
+    *,
+    to_agents: Sequence[Agent],
+    cc_agents: Sequence[Agent],
+    bcc_agents: Sequence[Agent],
+    subject: str,
+    body_md: str,
+    importance: str,
+    ack_required: bool,
+    thread_id: Optional[str],
+    topic: Optional[str],
+    reply_to: Optional[int],
+    attachment_paths: Sequence[str],
+    convert_images_override: Optional[bool],
+) -> str:
+    """Return a stable digest of caller-supplied message parameters."""
+
+    def _recipient_ids(agents: Sequence[Agent]) -> list[int]:
+        ids = [agent.id for agent in agents]
+        if any(agent_id is None for agent_id in ids):
+            raise ValueError("Recipients must have ids before computing a message digest.")
+        return [cast(int, agent_id) for agent_id in ids]
+
+    canonical_content = {
+        "version": 2,
+        "recipients": {
+            "to": _recipient_ids(to_agents),
+            "cc": _recipient_ids(cc_agents),
+            "bcc": _recipient_ids(bcc_agents),
+        },
+        "subject": subject,
+        "body_md": body_md,
+        "importance": importance,
+        "ack_required": ack_required,
+        "thread_id": thread_id,
+        "topic": topic,
+        "reply_to": reply_to,
+        "attachment_paths": list(attachment_paths),
+        "convert_images_override": convert_images_override,
+    }
+    encoded = json.dumps(
+        canonical_content,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_json_fallback,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _attachment_source_digest(
+    *,
+    settings: Settings,
+    project: Project,
+    attachment_paths: Sequence[str],
+    body_md: str = "",
+    include_markdown: bool = False,
+) -> tuple[str, bool]:
+    """Hash available attachment sources without mutating the archive.
+
+    A missing source is represented by ``None`` so an already accepted message
+    can replay after its ephemeral caller-side file has been removed. Existing
+    sources are content-bound, preventing a changed file at the same path from
+    being accepted as an identical idempotent request.
+    """
+    source_paths = list(attachment_paths)
+    if include_markdown:
+        source_paths.extend(
+            match.group("path").strip()
+            for match in _IMAGE_PATTERN.finditer(body_md)
+            if not match.group("path").strip().startswith("data:")
+        )
+    if not source_paths:
+        return hashlib.sha256(b"[]").hexdigest(), True
+    archive_root = Path(settings.storage.root).expanduser().resolve() / "projects" / project.slug
+    fingerprints: list[dict[str, str | None]] = []
+    all_available = True
+    for raw_path in source_paths:
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = archive_root / path
+        path = path.resolve()
+        digest: str | None = None
+        if path.is_file():
+            hasher = hashlib.sha256()
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            digest = hasher.hexdigest()
+        else:
+            all_available = False
+        fingerprints.append({"path": raw_path, "sha256": digest})
+    encoded = json.dumps(fingerprints, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), all_available
+
+
+def _message_source_digest(request_digest: str, attachment_digest: str | None) -> str:
+    encoded = json.dumps(
+        {"version": 1, "request": request_digest, "attachments": attachment_digest},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_idempotent_replay(
+    message: Message,
+    *,
+    idempotency_key: str,
+    request_digest: str,
+    content_digest: str,
+    attachment_source_available: bool,
+) -> None:
+    if (
+        message.idempotency_request_digest is not None
+        and hmac.compare_digest(message.idempotency_request_digest, request_digest)
+        and (
+            not attachment_source_available
+            or message.content_digest is None
+            or hmac.compare_digest(message.content_digest, content_digest)
+        )
+    ):
+        return
+    raise ToolExecutionError(
+        "IDEMPOTENCY_KEY_CONFLICT",
+        "The idempotency key was already used for different message content.",
+        recoverable=False,
+        data={"idempotency_key": idempotency_key, "message_id": message.id},
+    )
+
+
+async def _find_idempotent_message(
+    project: Project,
+    sender: Agent,
+    *,
+    idempotency_key: str,
+    request_digest: str,
+    content_digest: str,
+    attachment_source_available: bool,
+) -> Message | None:
+    if project.id is None:
+        raise ValueError("Project must have an id before finding messages.")
+    if sender.id is None:
+        raise ValueError("Sender must have an id before finding messages.")
+    await ensure_schema()
+    async with get_session() as session:
+        existing_result = await session.execute(
+            select(Message).where(
+                Message.project_id == project.id,
+                Message.sender_id == sender.id,
+                Message.idempotency_key == idempotency_key,
+            )
+        )
+        existing = existing_result.scalars().first()
+    if existing is not None:
+        _validate_idempotent_replay(
+            existing,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            content_digest=content_digest,
+            attachment_source_available=attachment_source_available,
+        )
+    return existing
+
+
 async def _create_message(
     project: Project,
     sender: Agent,
@@ -3800,11 +3968,28 @@ async def _create_message(
     attachments: Sequence[dict[str, Any]],
     topic: Optional[str] = None,
     reply_to: Optional[int] = None,
-) -> Message:
+    idempotency_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    content_digest: Optional[str] = None,
+    attachment_source_available: bool = True,
+) -> tuple[Message, bool]:
     if project.id is None:
         raise ValueError("Project must have an id before creating messages.")
     if sender.id is None:
         raise ValueError("Sender must have an id before sending messages.")
+    if idempotency_key is not None and (request_digest is None or content_digest is None):
+        raise ValueError("Idempotent messages require request and content digests.")
+    if idempotency_key is not None:
+        existing = await _find_idempotent_message(
+            project,
+            sender,
+            idempotency_key=idempotency_key,
+            request_digest=cast(str, request_digest),
+            content_digest=cast(str, content_digest),
+            attachment_source_available=attachment_source_available,
+        )
+        if existing is not None:
+            return existing, False
     await ensure_schema()
     async with get_session() as session:
         message = Message(
@@ -3818,9 +4003,28 @@ async def _create_message(
             topic=topic,
             reply_to=reply_to,
             attachments=list(attachments),
+            idempotency_key=idempotency_key,
+            idempotency_request_digest=request_digest,
+            content_digest=content_digest,
         )
         session.add(message)
-        await session.flush()
+        try:
+            await session.flush()
+        except IntegrityError:
+            await session.rollback()
+            if idempotency_key is None:
+                raise
+            existing = await _find_idempotent_message(
+                project,
+                sender,
+                idempotency_key=idempotency_key,
+                request_digest=cast(str, request_digest),
+                content_digest=cast(str, content_digest),
+                attachment_source_available=True,
+            )
+            if existing is None:
+                raise
+            return existing, False
         assert message.id is not None
         for recipient, kind in recipients:
             assert recipient.id is not None
@@ -3830,7 +4034,7 @@ async def _create_message(
         session.add(sender)
         await session.commit()
         await session.refresh(message)
-    return message
+    return message, True
 
 
 async def _create_file_reservation(
@@ -5445,6 +5649,7 @@ def build_mcp_server() -> FastMCP:
         thread_id: Optional[str],
         topic: Optional[str] = None,
         reply_to: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
     ) -> dict[str, Any]:
         # Re-fetch settings at call time so tests that mutate env + clear cache take effect
         settings = get_settings()
@@ -5477,7 +5682,6 @@ def build_mcp_server() -> FastMCP:
         recipient_records.extend((agent, "cc") for agent in cc_agents)
         recipient_records.extend((agent, "bcc") for agent in bcc_agents)
 
-        archive = await ensure_archive(settings, project.slug)
         sender_project = project if sender.project_id == project.id else await _get_project_by_id(sender.project_id)
         sender_is_local = sender_project.id == project.id
         sender_archive_label = _sender_display_name(
@@ -5504,7 +5708,97 @@ def build_mcp_server() -> FastMCP:
         if _wi_uuid and _validate_window_uuid(_wi_uuid):
             window_identity = await _get_window_identity(project, _wi_uuid)
 
+        request_digest = (
+            _message_content_digest(
+                to_agents=to_agents,
+                cc_agents=cc_agents,
+                bcc_agents=bcc_agents,
+                subject=subject,
+                body_md=body_md,
+                importance=importance,
+                ack_required=ack_required,
+                thread_id=thread_id,
+                topic=topic,
+                reply_to=reply_to,
+                attachment_paths=attachment_paths or [],
+                convert_images_override=convert_images_override,
+            )
+            if idempotency_key is not None
+            else None
+        )
+        attachment_digest: str | None = None
+        attachment_source_available = True
+        if idempotency_key is not None:
+            attachment_digest, attachment_source_available = _attachment_source_digest(
+                settings=settings,
+                project=project,
+                attachment_paths=attachment_paths or [],
+                body_md=body_md,
+                include_markdown=convert_markdown or embed_policy in {"inline", "file"},
+            )
+        content_digest = (
+            _message_source_digest(cast(str, request_digest), attachment_digest)
+            if idempotency_key is not None
+            else None
+        )
+        recipients_for_archive = [agent.name for agent in to_agents + cc_agents + bcc_agents]
+
+        def _build_delivery_payload(delivery_message: Message) -> dict[str, Any]:
+            delivery_payload = _message_to_dict(delivery_message)
+            delivery_payload.update(
+                {
+                    "to": [agent.name for agent in to_agents],
+                    "cc": [agent.name for agent in cc_agents],
+                    "bcc": [agent.name for agent in bcc_agents],
+                    "attachments": delivery_message.attachments,
+                }
+            )
+            _apply_sender_identity(
+                delivery_payload,
+                message_project_id=delivery_message.project_id,
+                sender_name=sender.name,
+                sender_project_id=sender_project.id,
+                sender_project_human_key=sender_project.human_key,
+                sender_project_slug=sender_project.slug,
+            )
+            if window_identity is not None:
+                delivery_payload["window_id"] = window_identity.window_uuid
+                delivery_payload["window_display_name"] = window_identity.display_name
+            return delivery_payload
+
+        async def _idempotent_replay_payload() -> dict[str, Any] | None:
+            if idempotency_key is None:
+                return None
+            existing_message = await _find_idempotent_message(
+                project,
+                sender,
+                idempotency_key=idempotency_key,
+                request_digest=cast(str, request_digest),
+                content_digest=cast(str, content_digest),
+                attachment_source_available=attachment_source_available,
+            )
+            if existing_message is None:
+                return None
+            await ctx.info(
+                f"Message {existing_message.id} replayed by {sender.name} "
+                f"(to {', '.join(recipients_for_archive)})"
+            )
+            return _build_delivery_payload(existing_message)
+
+        replay_payload = await _idempotent_replay_payload()
+        if replay_payload is not None:
+            return replay_payload
+
+        archive = await ensure_archive(settings, project.slug)
+
         async with _archive_write_lock(archive):
+            # Another provider process may have accepted this key after the
+            # lock-free check above. Recheck while holding the archive lock so
+            # the losing call does not process attachments or append audits.
+            replay_payload = await _idempotent_replay_payload()
+            if replay_payload is not None:
+                return replay_payload
+
             # Server-side file_reservations enforcement: block if conflicting active exclusive file_reservation exists
             if settings.file_reservations_enforcement_enabled:
                 await _expire_stale_file_reservations(
@@ -5602,7 +5896,7 @@ def build_mcp_server() -> FastMCP:
             # Fallback: if body contains inline data URI, reflect that in attachments meta for API parity
             if not attachments_meta and ("data:image" in body_md):
                 attachments_meta.append({"type": "inline", "media_type": "image/webp"})
-            message = await _create_message(
+            message, message_created = await _create_message(
                 project,
                 sender,
                 subject,
@@ -5614,74 +5908,59 @@ def build_mcp_server() -> FastMCP:
                 attachments_meta,
                 topic=topic,
                 reply_to=reply_to,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+                content_digest=content_digest,
+                attachment_source_available=attachment_source_available,
             )
-            frontmatter = _message_frontmatter(
-                message,
-                project,
-                sender,
-                sender_project,
-                to_agents,
-                cc_agents,
-                bcc_agents,
-                attachments_meta,
-            )
-            recipients_for_archive = [agent.name for agent in to_agents + cc_agents + bcc_agents]
-            payload = _message_to_dict(message)
-            payload.update(
-                {
-                    "to": [agent.name for agent in to_agents],
-                    "cc": [agent.name for agent in cc_agents],
-                    "bcc": [agent.name for agent in bcc_agents],
-                    "attachments": attachments_meta,
-                }
-            )
-            _apply_sender_identity(
-                payload,
-                message_project_id=message.project_id,
-                sender_name=sender.name,
-                sender_project_id=sender_project.id,
-                sender_project_human_key=sender_project.human_key,
-                sender_project_slug=sender_project.slug,
-            )
-            # Enrich payload with sender's window identity if available.
-            if window_identity is not None:
-                payload["window_id"] = window_identity.window_uuid
-                payload["window_display_name"] = window_identity.display_name
-            try:
-                await write_message_bundle(
-                    archive,
-                    frontmatter,
-                    processed_body,
-                    sender_archive_label,
-                    recipients_for_archive,
-                    attachment_files,
-                    sender_outbox_name=sender.name if sender_is_local else None,
+            payload = _build_delivery_payload(message)
+            if message_created:
+                frontmatter = _message_frontmatter(
+                    message,
+                    project,
+                    sender,
+                    sender_project,
+                    to_agents,
+                    cc_agents,
+                    bcc_agents,
+                    attachments_meta,
                 )
-            except Exception:
-                # #180: _create_message already committed the message + recipient
-                # rows. If the archive write fails, roll them back so we never
-                # leave a committed DB row with no archive artifact (mirrors the
-                # #173 agent-registration compensation). Best-effort cleanup; the
-                # original archive error is always re-raised.
-                with suppress(Exception):
-                    async with get_session() as rollback_session:
-                        orphan_recipients = (
-                            await rollback_session.execute(
-                                select(MessageRecipient).where(
-                                    MessageRecipient.message_id == message.id
+                try:
+                    await write_message_bundle(
+                        archive,
+                        frontmatter,
+                        processed_body,
+                        sender_archive_label,
+                        recipients_for_archive,
+                        attachment_files,
+                        sender_outbox_name=sender.name if sender_is_local else None,
+                    )
+                except Exception:
+                    # #180: _create_message already committed the message + recipient
+                    # rows. If the archive write fails, roll them back so we never
+                    # leave a committed DB row with no archive artifact (mirrors the
+                    # #173 agent-registration compensation). Best-effort cleanup; the
+                    # original archive error is always re-raised.
+                    with suppress(Exception):
+                        async with get_session() as rollback_session:
+                            orphan_recipients = (
+                                await rollback_session.execute(
+                                    select(MessageRecipient).where(
+                                        MessageRecipient.message_id == message.id
+                                    )
                                 )
-                            )
-                        ).scalars().all()
-                        for orphan_recipient in orphan_recipients:
-                            await rollback_session.delete(orphan_recipient)
-                        orphan_message = await rollback_session.get(Message, message.id)
-                        if orphan_message is not None:
-                            await rollback_session.delete(orphan_message)
-                        await rollback_session.commit()
-                raise
+                            ).scalars().all()
+                            for orphan_recipient in orphan_recipients:
+                                await rollback_session.delete(orphan_recipient)
+                            orphan_message = await rollback_session.get(Message, message.id)
+                            if orphan_message is not None:
+                                await rollback_session.delete(orphan_message)
+                            await rollback_session.commit()
+                    raise
 
-            # Collect notification signals for post-lock emission.
-            if settings.notifications.enabled:
+            # Replays return the original receipt without a second archive write
+            # or notification signal.
+            if message_created and settings.notifications.enabled:
                 notification_message_meta = {
                     "id": message.id,
                     "from": sender.name,
@@ -5704,9 +5983,8 @@ def build_mcp_server() -> FastMCP:
                     )
         if message is None:
             raise RuntimeError("Message record was not created.")
-        await ctx.info(
-            f"Message {message.id} created by {sender.name} (to {', '.join(recipients_for_archive)})"
-        )
+        action = "created" if message_created else "replayed"
+        await ctx.info(f"Message {message.id} {action} by {sender.name} (to {', '.join(recipients_for_archive)})")
         if payload is None:
             raise RuntimeError("Message payload was not generated.")
         return payload
@@ -7128,6 +7406,7 @@ def build_mcp_server() -> FastMCP:
         broadcast: bool = False,
         topic: Optional[str] = None,
         auto_contact_if_blocked: Optional[bool] = None,
+        idempotency_key: Optional[str] = None,
         sender_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -7198,6 +7477,11 @@ def build_mcp_server() -> FastMCP:
             unless overridden). The pending-request TTL is governed by
             ``CONTACT_PENDING_TTL_SECONDS`` (default 7 days, separate from the in-session
             auto-approval TTL ``CONTACT_AUTO_TTL_SECONDS``).
+        idempotency_key : Optional[str]
+            Optional caller-generated key, scoped to the project and sender. Reusing a key
+            with identical message content returns the original receipt without creating a
+            second message. Reusing it with different content fails. Keys must contain
+            1-256 characters when provided.
 
         Returns
         -------
@@ -7254,6 +7538,14 @@ def build_mcp_server() -> FastMCP:
         ```
         """
         project = await _get_project_by_identifier(project_key)
+
+        if idempotency_key is not None and (not idempotency_key.strip() or len(idempotency_key) > 256):
+            raise ToolExecutionError(
+                "INVALID_IDEMPOTENCY_KEY",
+                "idempotency_key must contain 1-256 characters when provided.",
+                recoverable=True,
+                data={"argument": "idempotency_key", "provided_length": len(idempotency_key)},
+            )
 
         # Validate topic format if provided.
         #
@@ -8307,6 +8599,7 @@ def build_mcp_server() -> FastMCP:
                 ack_required,
                 thread_id,
                 topic=topic,
+                idempotency_key=idempotency_key,
             )
             _collect_delivery_result(deliveries, delivery_errors, project, payload_local)
         # External per-target project deliver using the original sender identity.
@@ -8329,6 +8622,7 @@ def build_mcp_server() -> FastMCP:
                     ack_required,
                     thread_id,
                     topic=topic,
+                    idempotency_key=idempotency_key,
                 )
                 _collect_delivery_result(deliveries, delivery_errors, p, payload_ext)
             except Exception as exc:
