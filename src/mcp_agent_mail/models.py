@@ -116,6 +116,7 @@ class Message(SQLModel, table=True):
     importance: str = Field(default="normal", max_length=16)
     ack_required: bool = Field(default=False)
     idempotency_key: Optional[str] = Field(default=None, max_length=256)
+    idempotency_request_digest: Optional[str] = Field(default=None, max_length=64)
     content_digest: Optional[str] = Field(default=None, max_length=64)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     attachments: list[dict[str, Any]] = Field(

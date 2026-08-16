@@ -280,6 +280,43 @@ async def test_send_message_idempotent_attachment_replay_does_not_reread_source(
         assert _archive_state() == before_replay
 
 
+@pytest.mark.asyncio
+async def test_send_message_idempotent_attachment_content_change_conflicts(
+    isolated_env,
+    monkeypatch,
+    tmp_path,
+):
+    """Replacing an existing attachment at the same path is not an identical replay."""
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
+    _config.clear_settings_cache()
+    source_path = tmp_path / "mutable-attachment.png"
+    Image.new("RGB", (4, 4), color=(12, 34, 56)).save(source_path)
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender, receiver = await setup_project_with_agents(
+            client,
+            "/test/idempotency-attachment-conflict",
+            count=2,
+        )
+        arguments = {
+            "project_key": "/test/idempotency-attachment-conflict",
+            "sender_name": sender,
+            "to": [receiver],
+            "subject": "Mutable attachment",
+            "body_md": "The source content changes after acceptance.",
+            "attachment_paths": [str(source_path)],
+            "idempotency_key": "mutable-attachment-receipt",
+        }
+        await client.call_tool("send_message", arguments)
+        Image.new("RGB", (4, 4), color=(201, 202, 203)).save(source_path)
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool("send_message", arguments)
+
+        assert "different message content" in str(exc_info.value)
+
+
 @pytest.mark.parametrize(
     ("changed_field", "changed_value"),
     [

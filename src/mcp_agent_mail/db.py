@@ -933,6 +933,7 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE agents ADD COLUMN registration_token VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE messages ADD COLUMN topic VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE messages ADD COLUMN idempotency_key VARCHAR(256) DEFAULT NULL",
+        "ALTER TABLE messages ADD COLUMN idempotency_request_digest VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE messages ADD COLUMN content_digest VARCHAR(64) DEFAULT NULL",
         # #188: persist the direct parent→child reply edge so replies survive a
         # round-trip through the DB (previously reply_to lived only in the

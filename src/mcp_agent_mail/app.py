@@ -3840,13 +3840,69 @@ def _message_content_digest(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _attachment_source_digest(
+    *,
+    settings: Settings,
+    project: Project,
+    attachment_paths: Sequence[str],
+) -> tuple[str, bool]:
+    """Hash available attachment sources without mutating the archive.
+
+    A missing source is represented by ``None`` so an already accepted message
+    can replay after its ephemeral caller-side file has been removed. Existing
+    sources are content-bound, preventing a changed file at the same path from
+    being accepted as an identical idempotent request.
+    """
+    if not attachment_paths:
+        return hashlib.sha256(b"[]").hexdigest(), True
+    archive_root = Path(settings.storage.root).expanduser().resolve() / "projects" / project.slug
+    fingerprints: list[dict[str, str | None]] = []
+    all_available = True
+    for raw_path in attachment_paths:
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = archive_root / path
+        path = path.resolve()
+        digest: str | None = None
+        if path.is_file():
+            hasher = hashlib.sha256()
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            digest = hasher.hexdigest()
+        else:
+            all_available = False
+        fingerprints.append({"path": raw_path, "sha256": digest})
+    encoded = json.dumps(fingerprints, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), all_available
+
+
+def _message_source_digest(request_digest: str, attachment_digest: str | None) -> str:
+    encoded = json.dumps(
+        {"version": 1, "request": request_digest, "attachments": attachment_digest},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _validate_idempotent_replay(
     message: Message,
     *,
     idempotency_key: str,
+    request_digest: str,
     content_digest: str,
+    attachment_source_available: bool,
 ) -> None:
-    if message.content_digest is not None and hmac.compare_digest(message.content_digest, content_digest):
+    if (
+        message.idempotency_request_digest is not None
+        and hmac.compare_digest(message.idempotency_request_digest, request_digest)
+        and (
+            not attachment_source_available
+            or message.content_digest is None
+            or hmac.compare_digest(message.content_digest, content_digest)
+        )
+    ):
         return
     raise ToolExecutionError(
         "IDEMPOTENCY_KEY_CONFLICT",
@@ -3861,7 +3917,9 @@ async def _find_idempotent_message(
     sender: Agent,
     *,
     idempotency_key: str,
+    request_digest: str,
     content_digest: str,
+    attachment_source_available: bool,
 ) -> Message | None:
     if project.id is None:
         raise ValueError("Project must have an id before finding messages.")
@@ -3881,7 +3939,9 @@ async def _find_idempotent_message(
         _validate_idempotent_replay(
             existing,
             idempotency_key=idempotency_key,
+            request_digest=request_digest,
             content_digest=content_digest,
+            attachment_source_available=attachment_source_available,
         )
     return existing
 
@@ -3899,20 +3959,24 @@ async def _create_message(
     topic: Optional[str] = None,
     reply_to: Optional[int] = None,
     idempotency_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
     content_digest: Optional[str] = None,
+    attachment_source_available: bool = True,
 ) -> tuple[Message, bool]:
     if project.id is None:
         raise ValueError("Project must have an id before creating messages.")
     if sender.id is None:
         raise ValueError("Sender must have an id before sending messages.")
-    if idempotency_key is not None and content_digest is None:
-        raise ValueError("Idempotent messages require a content digest.")
+    if idempotency_key is not None and (request_digest is None or content_digest is None):
+        raise ValueError("Idempotent messages require request and content digests.")
     if idempotency_key is not None:
         existing = await _find_idempotent_message(
             project,
             sender,
             idempotency_key=idempotency_key,
+            request_digest=cast(str, request_digest),
             content_digest=cast(str, content_digest),
+            attachment_source_available=attachment_source_available,
         )
         if existing is not None:
             return existing, False
@@ -3930,6 +3994,7 @@ async def _create_message(
             reply_to=reply_to,
             attachments=list(attachments),
             idempotency_key=idempotency_key,
+            idempotency_request_digest=request_digest,
             content_digest=content_digest,
         )
         session.add(message)
@@ -3943,7 +4008,9 @@ async def _create_message(
                 project,
                 sender,
                 idempotency_key=idempotency_key,
+                request_digest=cast(str, request_digest),
                 content_digest=cast(str, content_digest),
+                attachment_source_available=True,
             )
             if existing is None:
                 raise
@@ -5631,7 +5698,7 @@ def build_mcp_server() -> FastMCP:
         if _wi_uuid and _validate_window_uuid(_wi_uuid):
             window_identity = await _get_window_identity(project, _wi_uuid)
 
-        content_digest = (
+        request_digest = (
             _message_content_digest(
                 to_agents=to_agents,
                 cc_agents=cc_agents,
@@ -5646,6 +5713,19 @@ def build_mcp_server() -> FastMCP:
                 attachment_paths=attachment_paths or [],
                 convert_images_override=convert_images_override,
             )
+            if idempotency_key is not None
+            else None
+        )
+        attachment_digest: str | None = None
+        attachment_source_available = True
+        if idempotency_key is not None:
+            attachment_digest, attachment_source_available = _attachment_source_digest(
+                settings=settings,
+                project=project,
+                attachment_paths=attachment_paths or [],
+            )
+        content_digest = (
+            _message_source_digest(cast(str, request_digest), attachment_digest)
             if idempotency_key is not None
             else None
         )
@@ -5681,7 +5761,9 @@ def build_mcp_server() -> FastMCP:
                 project,
                 sender,
                 idempotency_key=idempotency_key,
+                request_digest=cast(str, request_digest),
                 content_digest=cast(str, content_digest),
+                attachment_source_available=attachment_source_available,
             )
             if existing_message is None:
                 return None
@@ -5815,7 +5897,9 @@ def build_mcp_server() -> FastMCP:
                 topic=topic,
                 reply_to=reply_to,
                 idempotency_key=idempotency_key,
+                request_digest=request_digest,
                 content_digest=content_digest,
+                attachment_source_available=attachment_source_available,
             )
             payload = _build_delivery_payload(message)
             if message_created:
